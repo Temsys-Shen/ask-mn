@@ -4,21 +4,22 @@ function createMNAskMNAddon(mainPath) {
     {
       sceneWillConnect: function () {
         self.mainPath = mainPath;
-        console.log("[Ask MN] initialized");
+        self.floatingWebViewController = MNAskFloatingWebViewController.new();
+        mnAskAttachToWindow(self.floatingWebViewController, self.window);
+        console.log("[Ask MN] floating WebView attached");
       },
       sceneDidDisconnect: function () {
+        if (self.floatingWebViewController) {
+          mnAskDetachFromWindow(self.floatingWebViewController);
+          self.floatingWebViewController = null;
+        }
         console.log("[Ask MN] disconnected");
       },
-      queryAddonCommandStatus: function () {
-        return {
-          image: "icon.png",
-          object: self,
-          selector: "sayHello:",
-          checked: false,
-        };
-      },
-      sayHello: function () {
-        console.log("[Ask MN] Hello, MarginNote!");
+      controllerWillLayoutSubviews: function (controller) {
+        const studyController = Application.sharedInstance().studyController(self.window);
+        if (controller === studyController && self.floatingWebViewController) {
+          mnAskRefreshLayout(self.floatingWebViewController);
+        }
       },
     },
   );
