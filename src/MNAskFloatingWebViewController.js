@@ -66,7 +66,10 @@ function mnAskCreateButton(frame, title, titleSize, backgroundColor) {
 }
 
 function mnAskHostView(controller) {
-  return Application.sharedInstance().studyController(controller.hostWindow).view;
+  if (!controller.hostWindow) {
+    throw new Error("[Ask MN] hostWindow is required before attaching floating view");
+  }
+  return controller.hostWindow;
 }
 
 function mnAskEnsureHostFrontmost(controller) {
