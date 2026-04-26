@@ -15,6 +15,7 @@ const MNAskPanStateCancelled = 4;
 const MNAskPanStateFailed = 5;
 const MNAskDragThreshold = 4;
 const MNAskDesktopSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
+const MNAskStrictMaxTouchPointsValue = 0;
 const MNAskDefaultURL = "https://ima.qq.com/wiki/?shareId=ce7603cce1e6a158557e60670cbfa23bb20931a18c86c3ea4ecfe8f8afea72bd";
 const MNAskSnapPositions = [
   "top-left",
@@ -333,6 +334,11 @@ function mnAskInitializeControllerState(controller) {
   controller.dragBubbleFrame = null;
   controller.dragMoved = false;
   controller.suppressNextBubbleTap = false;
+  controller.blockedNavigationMessage = null;
+  controller.pendingStrictMaxTouchPointsValue = MNAskStrictMaxTouchPointsValue;
+  controller.lastTopLevelNavigationReason = null;
+  controller.loadingInjectedHTML = false;
+  controller.pendingTopLevelRequestURL = null;
 }
 
 function mnAskBuildViewHierarchy(controller) {
@@ -360,7 +366,6 @@ function mnAskBuildViewHierarchy(controller) {
   controller.webView.backgroundColor = UIColor.whiteColor();
   controller.webView.scalesPageToFit = true;
   controller.webView.autoresizingMask = (1 << 1 | 1 << 4 | 1 << 5);
-  controller.webView.customUserAgent = MNAskDesktopSafariUserAgent;
   controller.webView.delegate = controller;
   rootView.addSubview(controller.webView);
 
@@ -523,10 +528,327 @@ function mnAskRefreshLayout(controller) {
   mnAskApplyTransitionProgress(controller, controller.animationProgress || 0);
 }
 
+function mnAskEscapeHTML(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function mnAskCreateBlockingErrorHTML(message) {
+  const escapedMessage = mnAskEscapeHTML(message);
+  return [
+    "<!DOCTYPE html>",
+    "<html>",
+    "<head>",
+    "<meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    "<title>Ask MN blocked</title>",
+    "</head>",
+    "<body style=\"margin:0;background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\">",
+    "<div style=\"max-width:720px;margin:0 auto;padding:32px 24px 40px;line-height:1.6;\">",
+    "<h1 style=\"margin:0 0 16px;font-size:24px;\">Ask MN preload injection failed</h1>",
+    "<p style=\"margin:0 0 12px;\">Ask MN tried to rewrite the top-level HTML before handing it to UIWebView so navigator.maxTouchPoints could be overridden as early as possible.</p>",
+    "<p style=\"margin:0 0 20px;\">The current navigation was stopped because that preload injection step failed.</p>",
+    "<pre style=\"white-space:pre-wrap;background:#111827;border:1px solid #334155;border-radius:12px;padding:16px;margin:0;\">",
+    escapedMessage,
+    "</pre>",
+    "</div>",
+    "</body>",
+    "</html>",
+  ].join("");
+}
+
+function mnAskBase64Decode(input) {
+  const key = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  let output = "";
+  let index = 0;
+
+  while (index < input.length) {
+    const enc1 = key.indexOf(input.charAt(index));
+    index += 1;
+    const enc2 = key.indexOf(input.charAt(index));
+    index += 1;
+    const enc3 = key.indexOf(input.charAt(index));
+    index += 1;
+    const enc4 = key.indexOf(input.charAt(index));
+    index += 1;
+
+    const chr1 = (enc1 << 2) | (enc2 >> 4);
+    const chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+    const chr3 = ((enc3 & 3) << 6) | enc4;
+
+    output += String.fromCharCode(chr1);
+    if (enc3 !== 64) {
+      output += String.fromCharCode(chr2);
+    }
+    if (enc4 !== 64) {
+      output += String.fromCharCode(chr3);
+    }
+  }
+
+  return output;
+}
+
+function mnAskRequestURL(request) {
+  if (!request) {
+    return null;
+  }
+  if (typeof request.URL === "function") {
+    return request.URL();
+  }
+  if (request.URL) {
+    return request.URL;
+  }
+  if (typeof request.mainDocumentURL === "function") {
+    return request.mainDocumentURL();
+  }
+  return null;
+}
+
+function mnAskRequestMainDocumentURL(request) {
+  if (!request) {
+    return null;
+  }
+  if (typeof request.mainDocumentURL === "function") {
+    return request.mainDocumentURL();
+  }
+  return mnAskRequestURL(request);
+}
+
+function mnAskURLString(url) {
+  if (!url) {
+    return null;
+  }
+  if (typeof url.absoluteString === "function") {
+    return url.absoluteString();
+  }
+  if (typeof url.absoluteString === "string") {
+    return url.absoluteString;
+  }
+  return null;
+}
+
+function mnAskURLScheme(url) {
+  if (!url) {
+    return null;
+  }
+  if (typeof url.scheme === "function") {
+    return url.scheme();
+  }
+  if (typeof url.scheme === "string") {
+    return url.scheme;
+  }
+  return null;
+}
+
+function mnAskDictionaryObject(dictionary, key) {
+  if (!dictionary) {
+    return null;
+  }
+  if (typeof dictionary.objectForKey === "function") {
+    return dictionary.objectForKey(key);
+  }
+  if (dictionary[key]) {
+    return dictionary[key];
+  }
+  return null;
+}
+
+function mnAskIsNil(value) {
+  return value === null || typeof value === "undefined" || value instanceof NSNull;
+}
+
+function mnAskErrorDescription(error) {
+  if (mnAskIsNil(error)) {
+    return "Unknown error";
+  }
+  if (typeof error.localizedDescription === "string" && error.localizedDescription) {
+    return error.localizedDescription;
+  }
+  if (typeof error.localizedFailureReason === "string" && error.localizedFailureReason) {
+    return error.localizedFailureReason;
+  }
+  if (typeof error.code === "number" && typeof error.domain === "string") {
+    return error.domain + " code " + String(error.code);
+  }
+  if (error.userInfo) {
+    const infoDescription = mnAskDictionaryObject(error.userInfo, "NSLocalizedDescription");
+    if (infoDescription) {
+      return String(infoDescription);
+    }
+  }
+  return String(error);
+}
+
+function mnAskDataToText(data) {
+  if (mnAskIsNil(data) || data.length() === 0) {
+    return "";
+  }
+  const binaryText = mnAskBase64Decode(data.base64Encoding());
+  try {
+    return decodeURIComponent(escape(binaryText));
+  } catch (error) {
+    return binaryText;
+  }
+}
+
+function mnAskIsTopLevelNavigationRequest(request) {
+  const requestURL = mnAskRequestURL(request);
+  const mainDocumentURL = mnAskRequestMainDocumentURL(request);
+  const requestURLString = mnAskURLString(requestURL);
+  const mainDocumentURLString = mnAskURLString(mainDocumentURL);
+  if (!requestURLString) {
+    return false;
+  }
+  if (!mainDocumentURLString) {
+    return true;
+  }
+  return requestURLString === mainDocumentURLString;
+}
+
+function mnAskInjectedOverrideScript() {
+  return [
+    "<script>",
+    "(function(){",
+    "var value=" + String(MNAskStrictMaxTouchPointsValue) + ";",
+    "function define(target,key){",
+    "if(!target){return false;}",
+    "try{Object.defineProperty(target,key,{configurable:true,get:function(){return value;}});return true;}catch(error){return false;}",
+    "}",
+    "define(window.Navigator&&window.Navigator.prototype,'maxTouchPoints')||define(navigator,'maxTouchPoints');",
+    "})();",
+    "</script>",
+  ].join("");
+}
+
+function mnAskInjectPreloadScript(html, baseURLString) {
+  const script = mnAskInjectedOverrideScript();
+  const baseTag = baseURLString
+    ? "<base href=\"" + mnAskEscapeHTML(baseURLString) + "\">"
+    : "";
+  const headPattern = /<head\b[^>]*>/i;
+  if (headPattern.test(html)) {
+    return html.replace(headPattern, function (match) {
+      return match + baseTag + script;
+    });
+  }
+  const htmlPattern = /<html\b[^>]*>/i;
+  if (htmlPattern.test(html)) {
+    return html.replace(htmlPattern, function (match) {
+      return match + "<head>" + baseTag + script + "</head>";
+    });
+  }
+  return "<!DOCTYPE html><html><head>" + baseTag + script + "</head><body>" + html + "</body></html>";
+}
+
+function mnAskPresentBlockingError(controller, message) {
+  controller.blockedNavigationMessage = message;
+  controller.loadingInjectedHTML = false;
+  console.log(message);
+  controller.webView.stopLoading();
+  controller.webView.loadHTMLStringBaseURL(
+    mnAskCreateBlockingErrorHTML(message),
+    null,
+  );
+}
+
+function mnAskApplyPreNavigationOverrides(controller) {
+  controller.webView.customUserAgent = MNAskDesktopSafariUserAgent;
+  controller.pendingStrictMaxTouchPointsValue = MNAskStrictMaxTouchPointsValue;
+}
+
+function mnAskCreateFetchRequest(sourceRequest) {
+  const sourceURL = mnAskRequestURL(sourceRequest);
+  const request = NSMutableURLRequest.requestWithURL(sourceURL);
+  request.setTimeoutInterval(20);
+  request.setValueForHTTPHeaderField(
+    MNAskDesktopSafariUserAgent,
+    "User-Agent",
+  );
+  request.setValueForHTTPHeaderField("text/html,application/xhtml+xml", "Accept");
+
+  if (sourceRequest && typeof sourceRequest.HTTPMethod === "function") {
+    const method = sourceRequest.HTTPMethod();
+    if (method) {
+      request.setHTTPMethod(method);
+    }
+  }
+
+  if (sourceRequest && typeof sourceRequest.allHTTPHeaderFields === "function") {
+    const headers = sourceRequest.allHTTPHeaderFields();
+    const cookieHeader = mnAskDictionaryObject(headers, "Cookie");
+    const acceptLanguageHeader = mnAskDictionaryObject(headers, "Accept-Language");
+    if (cookieHeader) {
+      request.setValueForHTTPHeaderField(String(cookieHeader), "Cookie");
+    }
+    if (acceptLanguageHeader) {
+      request.setValueForHTTPHeaderField(String(acceptLanguageHeader), "Accept-Language");
+    }
+  }
+
+  return request;
+}
+
+function mnAskFetchAndLoadTopLevelRequest(controller, request, reason) {
+  mnAskApplyPreNavigationOverrides(controller);
+  controller.lastTopLevelNavigationReason = reason;
+  const url = mnAskRequestURL(request);
+  const targetURL = mnAskURLString(url) || "<unknown>";
+  const fetchRequest = mnAskCreateFetchRequest(request);
+  controller.pendingTopLevelRequestURL = targetURL;
+  NSURLConnection.sendAsynchronousRequestQueueCompletionHandler(
+    fetchRequest,
+    NSOperationQueue.mainQueue(),
+    function (response, data, error) {
+      if (!mnAskIsNil(error)) {
+        mnAskPresentBlockingError(
+          controller,
+          "[Ask MN] Failed to fetch top-level HTML before injection. "
+            + "URL: " + targetURL + ". "
+            + "Error: " + mnAskErrorDescription(error),
+        );
+        return;
+      }
+      if (mnAskIsNil(data) || data.length() === 0) {
+        mnAskPresentBlockingError(
+          controller,
+          "[Ask MN] Top-level HTML response was empty before injection. URL: " + targetURL + ".",
+        );
+        return;
+      }
+      const html = mnAskDataToText(data);
+      const injectedHTML = mnAskInjectPreloadScript(html, targetURL);
+      controller.blockedNavigationMessage = null;
+      controller.loadingInjectedHTML = true;
+      console.log("[Ask MN] Loading injected top-level HTML: " + targetURL);
+      controller.webView.loadHTMLStringBaseURL(injectedHTML, url);
+    },
+  );
+}
+
+function mnAskLoadTopLevelRequest(controller, request, reason) {
+  const url = mnAskRequestURL(request);
+  const targetURL = mnAskURLString(url) || "<unknown>";
+  controller.blockedNavigationMessage = null;
+  if (!NSURLConnection.canHandleRequest(request)) {
+    mnAskPresentBlockingError(
+      controller,
+      "[Ask MN] NSURLConnection cannot handle top-level request for early maxTouchPoints injection. "
+        + "URL: " + targetURL + ".",
+    );
+    return false;
+  }
+  mnAskFetchAndLoadTopLevelRequest(controller, request, reason);
+  return true;
+}
+
 function mnAskLoadDefaultPage(controller) {
   const url = NSURL.URLWithString(MNAskDefaultURL);
   const request = NSURLRequest.requestWithURL(url);
-  controller.webView.loadRequest(request);
+  mnAskLoadTopLevelRequest(controller, request, "default-page");
 }
 
 var MNAskFloatingWebViewController = JSB.defineClass(
@@ -560,18 +882,46 @@ var MNAskFloatingWebViewController = JSB.defineClass(
       mnAskStartTransition(self, false);
     },
     webViewDidStartLoad: function () {
-      console.log("[Ask MN] WebView started loading IMA page");
+      console.log("[Ask MN] WebView started loading");
     },
     webViewDidFinishLoad: function () {
-      console.log("[Ask MN] WebView finished loading IMA page");
+      self.loadingInjectedHTML = false;
+      if (self.blockedNavigationMessage) {
+        console.log("[Ask MN] WebView finished loading blocking error page");
+        return;
+      }
+      console.log("[Ask MN] WebView finished loading");
     },
     webViewDidFailLoadWithError: function (webView, error) {
+      self.loadingInjectedHTML = false;
       console.log(
-        "[Ask MN] WebView failed to load IMA page: " + error.localizedDescription,
+        "[Ask MN] WebView failed to load: " + error.localizedDescription,
       );
     },
-    webViewShouldStartLoadWithRequestNavigationType: function () {
-      return true;
+    webViewShouldStartLoadWithRequestNavigationType: function (webView, request) {
+      if (self.blockedNavigationMessage) {
+        const url = mnAskRequestURL(request);
+        const scheme = mnAskURLScheme(url);
+        if (scheme !== "http" && scheme !== "https") {
+          return true;
+        }
+        console.log("[Ask MN] Blocking navigation while preload injection error page is shown");
+        return false;
+      }
+      const url = mnAskRequestURL(request);
+      const scheme = mnAskURLScheme(url);
+      if (scheme !== "http" && scheme !== "https") {
+        return true;
+      }
+      if (!mnAskIsTopLevelNavigationRequest(request)) {
+        return true;
+      }
+      if (self.loadingInjectedHTML) {
+        return true;
+      }
+      console.log("[Ask MN] Intercepting top-level navigation for early injection");
+      mnAskLoadTopLevelRequest(self, request, "delegate-navigation");
+      return false;
     },
   },
 );
