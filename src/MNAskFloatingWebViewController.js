@@ -1,9 +1,14 @@
 const MNAskAnimationFrameInterval = 1 / 60;
 const MNAskAnimationDuration = 0.24;
 const MNAskPostDragTapSuppressionDuration = 0.5;
-const MNAskBubbleSize = 56;
+const MNAskBubbleSize = 19;
 const MNAskBubbleMargin = 16;
-const MNAskMinimizeButtonSize = 56;
+const MNAskMinimizeButtonSize = 19;
+const MNAskLoadingIndicatorSize = 72;
+const MNAskLoadingIndicatorDotSize = 9;
+const MNAskLoadingIndicatorDotCount = 12;
+const MNAskLoadingIndicatorStepInterval = 0.08;
+const MNAskLoadingIndicatorMinAlpha = 0.2;
 const MNAskOverlayColor = UIColor.colorWithRedGreenBlueAlpha(0.05, 0.08, 0.14, 0.92);
 const MNAskBubbleColor = UIColor.colorWithRedGreenBlueAlpha(0.16, 0.49, 0.93, 1);
 const MNAskMinimizeButtonColor = MNAskBubbleColor;
@@ -57,6 +62,7 @@ function mnAskCreateButton(frame, title, titleSize, backgroundColor) {
   button.backgroundColor = backgroundColor;
   button.setTitleForState(title, 0);
   button.setTitleColorForState(UIColor.whiteColor(), 0);
+  button.titleLabel.font = UIFont.boldSystemFontOfSize(titleSize);
   button.layer.borderWidth = 1;
   button.layer.borderColor = MNAskBorderColor;
   button.layer.shadowColor = UIColor.colorWithWhiteAlpha(0, 0.35);
@@ -64,6 +70,15 @@ function mnAskCreateButton(frame, title, titleSize, backgroundColor) {
   button.layer.shadowOffset = { width: 0, height: 6 };
   button.layer.shadowRadius = 16;
   return button;
+}
+
+function mnAskCenteredFrame(width, height, bounds) {
+  return {
+    x: (bounds.width - width) / 2,
+    y: (bounds.height - height) / 2,
+    width,
+    height,
+  };
 }
 
 function mnAskHostView(controller) {
@@ -146,36 +161,6 @@ function mnAskArrowTitleForSnapPosition(snapPosition) {
   }
 }
 
-function mnAskMinimizeButtonFrame(expandedFrame, snapPosition, buttonInset) {
-  const centerX = (expandedFrame.width - MNAskMinimizeButtonSize) / 2;
-  const centerY = (expandedFrame.height - MNAskMinimizeButtonSize) / 2;
-  const leftX = buttonInset;
-  const rightX = expandedFrame.width - MNAskMinimizeButtonSize - buttonInset;
-  const topY = buttonInset;
-  const bottomY = expandedFrame.height - MNAskMinimizeButtonSize - buttonInset;
-
-  switch (snapPosition) {
-    case "top-left":
-      return { x: leftX, y: topY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "top-center":
-      return { x: centerX, y: topY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "top-right":
-      return { x: rightX, y: topY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "middle-left":
-      return { x: leftX, y: centerY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "middle-right":
-      return { x: rightX, y: centerY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "bottom-left":
-      return { x: leftX, y: bottomY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "bottom-center":
-      return { x: centerX, y: bottomY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    case "bottom-right":
-      return { x: rightX, y: bottomY, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize };
-    default:
-      throw new Error("[Ask MN] Unknown snap position for minimize button: " + snapPosition);
-  }
-}
-
 function mnAskBubbleCenter(frame) {
   return {
     x: frame.x + frame.width / 2,
@@ -223,6 +208,8 @@ function mnAskApplyTransitionProgress(controller, progress) {
   if (
     !controller.backgroundView
     || !controller.webView
+    || !controller.loadingOverlayView
+    || !controller.loadingIndicatorView
     || !controller.bubbleButton
     || !controller.minimizeButton
   ) {
@@ -236,8 +223,6 @@ function mnAskApplyTransitionProgress(controller, progress) {
   );
   const bubbleRadius = MNAskBubbleSize / 2;
   const fullRadius = 0;
-  const buttonInset = 12;
-
   controller.animationProgress = normalizedProgress;
   controller.view.frame = nextFrame;
   controller.view.layer.cornerRadius = mnAskLerp(
@@ -263,6 +248,24 @@ function mnAskApplyTransitionProgress(controller, progress) {
   controller.webView.alpha = normalizedProgress;
   controller.webView.hidden = normalizedProgress < 0.02;
 
+  controller.loadingOverlayView.frame = {
+    x: 0,
+    y: 0,
+    width: nextFrame.width,
+    height: nextFrame.height,
+  };
+  controller.loadingOverlayView.alpha = normalizedProgress;
+  controller.loadingIndicatorView.frame = mnAskCenteredFrame(
+    MNAskLoadingIndicatorSize,
+    MNAskLoadingIndicatorSize,
+    controller.loadingOverlayView.bounds,
+  );
+  mnAskLayoutLoadingIndicatorDots(controller);
+  controller.loadingOverlayView.hidden = (
+    !controller.showingLoadingIndicator
+    || normalizedProgress < 0.98
+  );
+
   controller.bubbleButton.frame = {
     x: 0,
     y: 0,
@@ -273,10 +276,9 @@ function mnAskApplyTransitionProgress(controller, progress) {
   controller.bubbleButton.alpha = 1 - normalizedProgress;
   controller.bubbleButton.hidden = normalizedProgress > 0.98;
 
-  controller.minimizeButton.frame = mnAskMinimizeButtonFrame(
-    nextFrame,
+  controller.minimizeButton.frame = mnAskSnapPointFrame(
+    controller,
     controller.snapPosition,
-    buttonInset,
   );
   controller.minimizeButton.layer.cornerRadius = MNAskMinimizeButtonSize / 2;
   controller.minimizeButton.setTitleForState(
@@ -339,6 +341,112 @@ function mnAskInitializeControllerState(controller) {
   controller.lastTopLevelNavigationReason = null;
   controller.loadingInjectedHTML = false;
   controller.pendingTopLevelRequestURL = null;
+  controller.currentTopLevelNavigationReason = null;
+  controller.shouldShowLoadingIndicatorForCurrentRequest = false;
+  controller.showingLoadingIndicator = false;
+  controller.loadingIndicatorDots = [];
+  controller.loadingIndicatorStep = 0;
+  controller.loadingIndicatorTimer = null;
+}
+
+function mnAskShouldShowLoadingIndicatorForReason(reason) {
+  return reason === "delegate-navigation";
+}
+
+function mnAskLayoutLoadingIndicatorDots(controller) {
+  if (!controller.loadingIndicatorView || !controller.loadingIndicatorDots) {
+    return;
+  }
+  const bounds = controller.loadingIndicatorView.bounds;
+  const centerX = bounds.width / 2;
+  const centerY = bounds.height / 2;
+  const radius = (Math.min(bounds.width, bounds.height) / 2) - (MNAskLoadingIndicatorDotSize / 2);
+  for (let index = 0; index < controller.loadingIndicatorDots.length; index += 1) {
+    const dot = controller.loadingIndicatorDots[index];
+    const angle = (-Math.PI / 2) + ((Math.PI * 2 * index) / MNAskLoadingIndicatorDotCount);
+    dot.frame = {
+      x: centerX + (Math.cos(angle) * radius) - (MNAskLoadingIndicatorDotSize / 2),
+      y: centerY + (Math.sin(angle) * radius) - (MNAskLoadingIndicatorDotSize / 2),
+      width: MNAskLoadingIndicatorDotSize,
+      height: MNAskLoadingIndicatorDotSize,
+    };
+    dot.layer.cornerRadius = MNAskLoadingIndicatorDotSize / 2;
+  }
+}
+
+function mnAskRenderLoadingIndicatorStep(controller) {
+  if (!controller.loadingIndicatorDots || controller.loadingIndicatorDots.length === 0) {
+    return;
+  }
+  for (let index = 0; index < controller.loadingIndicatorDots.length; index += 1) {
+    const dot = controller.loadingIndicatorDots[index];
+    const distance = (
+      (index - controller.loadingIndicatorStep + MNAskLoadingIndicatorDotCount)
+      % MNAskLoadingIndicatorDotCount
+    );
+    const alpha = Math.max(
+      MNAskLoadingIndicatorMinAlpha,
+      1 - (distance * ((1 - MNAskLoadingIndicatorMinAlpha) / MNAskLoadingIndicatorDotCount)),
+    );
+    dot.alpha = alpha;
+  }
+}
+
+function mnAskStopLoadingIndicatorAnimation(controller) {
+  if (controller.loadingIndicatorTimer && controller.loadingIndicatorTimer.isValid) {
+    controller.loadingIndicatorTimer.invalidate();
+  }
+  controller.loadingIndicatorTimer = null;
+}
+
+function mnAskStartLoadingIndicatorAnimation(controller) {
+  mnAskStopLoadingIndicatorAnimation(controller);
+  controller.loadingIndicatorStep = 0;
+  mnAskRenderLoadingIndicatorStep(controller);
+  controller.loadingIndicatorTimer = NSTimer.scheduledTimerWithTimeInterval(
+    MNAskLoadingIndicatorStepInterval,
+    true,
+    function () {
+      controller.loadingIndicatorStep = (
+        controller.loadingIndicatorStep + 1
+      ) % MNAskLoadingIndicatorDotCount;
+      mnAskRenderLoadingIndicatorStep(controller);
+    },
+  );
+}
+
+function mnAskSetLoadingIndicatorVisible(controller, visible) {
+  controller.showingLoadingIndicator = visible;
+  if (!controller.loadingOverlayView || !controller.loadingIndicatorView) {
+    return;
+  }
+  console.log("[Ask MN] Loading indicator " + (visible ? "shown" : "hidden"));
+  controller.loadingOverlayView.hidden = (
+    !visible
+    || (controller.animationProgress || 0) < 0.98
+  );
+  if (visible) {
+    mnAskStartLoadingIndicatorAnimation(controller);
+  } else {
+    mnAskStopLoadingIndicatorAnimation(controller);
+  }
+}
+
+function mnAskPrepareLoadingIndicatorForReason(controller, reason) {
+  controller.currentTopLevelNavigationReason = reason;
+  controller.shouldShowLoadingIndicatorForCurrentRequest = (
+    mnAskShouldShowLoadingIndicatorForReason(reason)
+  );
+  mnAskSetLoadingIndicatorVisible(
+    controller,
+    controller.shouldShowLoadingIndicatorForCurrentRequest,
+  );
+}
+
+function mnAskClearLoadingIndicator(controller) {
+  controller.currentTopLevelNavigationReason = null;
+  controller.shouldShowLoadingIndicatorForCurrentRequest = false;
+  mnAskSetLoadingIndicatorVisible(controller, false);
 }
 
 function mnAskBuildViewHierarchy(controller) {
@@ -369,10 +477,41 @@ function mnAskBuildViewHierarchy(controller) {
   controller.webView.delegate = controller;
   rootView.addSubview(controller.webView);
 
+  controller.loadingOverlayView = new UIView(rootView.bounds);
+  controller.loadingOverlayView.autoresizingMask = (1 << 1 | 1 << 4 | 1 << 5);
+  controller.loadingOverlayView.backgroundColor = UIColor.clearColor();
+  controller.loadingOverlayView.hidden = true;
+  rootView.addSubview(controller.loadingOverlayView);
+
+  controller.loadingIndicatorView = new UIView(
+    mnAskCenteredFrame(
+      MNAskLoadingIndicatorSize,
+      MNAskLoadingIndicatorSize,
+      controller.loadingOverlayView.bounds,
+    ),
+  );
+  controller.loadingIndicatorView.backgroundColor = UIColor.clearColor();
+  controller.loadingOverlayView.addSubview(controller.loadingIndicatorView);
+  controller.loadingIndicatorDots = [];
+  for (let index = 0; index < MNAskLoadingIndicatorDotCount; index += 1) {
+    const dot = new UIView({
+      x: 0,
+      y: 0,
+      width: MNAskLoadingIndicatorDotSize,
+      height: MNAskLoadingIndicatorDotSize,
+    });
+    dot.backgroundColor = MNAskBubbleColor;
+    dot.alpha = MNAskLoadingIndicatorMinAlpha;
+    controller.loadingIndicatorView.addSubview(dot);
+    controller.loadingIndicatorDots.push(dot);
+  }
+  mnAskLayoutLoadingIndicatorDots(controller);
+  mnAskRenderLoadingIndicatorStep(controller);
+
   controller.bubbleButton = mnAskCreateButton(
     { x: 0, y: 0, width: MNAskBubbleSize, height: MNAskBubbleSize },
     "?",
-    28,
+    10,
     MNAskBubbleColor,
   );
   controller.bubbleButton.addTargetActionForControlEvents(controller, "bubbleTapped:", 1 << 6);
@@ -387,7 +526,7 @@ function mnAskBuildViewHierarchy(controller) {
   controller.minimizeButton = mnAskCreateButton(
     { x: 0, y: 0, width: MNAskMinimizeButtonSize, height: MNAskMinimizeButtonSize },
     "↘",
-    22,
+    9,
     MNAskMinimizeButtonColor,
   );
   controller.minimizeButton.addTargetActionForControlEvents(controller, "minimizeTapped:", 1 << 6);
@@ -517,6 +656,7 @@ function mnAskAttachToWindow(controller, window) {
 function mnAskDetachFromWindow(controller) {
   mnAskStopAnimationTimer(controller);
   mnAskClearPostDragTapSuppression(controller);
+  mnAskClearLoadingIndicator(controller);
   controller.view.removeFromSuperview();
 }
 
@@ -747,6 +887,8 @@ function mnAskInjectPreloadScript(html, baseURLString) {
 function mnAskPresentBlockingError(controller, message) {
   controller.blockedNavigationMessage = message;
   controller.loadingInjectedHTML = false;
+  controller.currentTopLevelNavigationReason = "blocking-error-page";
+  mnAskClearLoadingIndicator(controller);
   console.log(message);
   controller.webView.stopLoading();
   controller.webView.loadHTMLStringBaseURL(
@@ -795,6 +937,7 @@ function mnAskCreateFetchRequest(sourceRequest) {
 function mnAskFetchAndLoadTopLevelRequest(controller, request, reason) {
   mnAskApplyPreNavigationOverrides(controller);
   controller.lastTopLevelNavigationReason = reason;
+  mnAskPrepareLoadingIndicatorForReason(controller, reason);
   const url = mnAskRequestURL(request);
   const targetURL = mnAskURLString(url) || "<unknown>";
   const fetchRequest = mnAskCreateFetchRequest(request);
@@ -865,6 +1008,7 @@ var MNAskFloatingWebViewController = JSB.defineClass(
     },
     viewWillDisappear: function () {
       mnAskStopAnimationTimer(self);
+      mnAskClearLoadingIndicator(self);
       self.webView.stopLoading();
       self.webView.delegate = null;
     },
@@ -886,6 +1030,7 @@ var MNAskFloatingWebViewController = JSB.defineClass(
     },
     webViewDidFinishLoad: function () {
       self.loadingInjectedHTML = false;
+      mnAskClearLoadingIndicator(self);
       if (self.blockedNavigationMessage) {
         console.log("[Ask MN] WebView finished loading blocking error page");
         return;
@@ -894,6 +1039,7 @@ var MNAskFloatingWebViewController = JSB.defineClass(
     },
     webViewDidFailLoadWithError: function (webView, error) {
       self.loadingInjectedHTML = false;
+      mnAskClearLoadingIndicator(self);
       console.log(
         "[Ask MN] WebView failed to load: " + error.localizedDescription,
       );
